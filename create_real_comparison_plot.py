@@ -18,6 +18,27 @@ from gluonts.torch.model.deepar import DeepAREstimator
 from gluonts.torch.distributions import TweedieOutput, NormalOutput
 from gluonts.evaluation import make_evaluation_predictions
 
+def compute_mase(forecast, actuals, training_series):
+    """
+    Compute Mean Absolute Scaled Error (MASE).
+
+    MASE = MAE(forecast) / MAE(naive_forecast_on_training)
+    where naive forecast is one-step ahead using previous value.
+    """
+    # MAE of the forecast
+    mae_forecast = np.mean(np.abs(forecast - actuals))
+
+    # MAE of naive forecast on training data (one-step ahead)
+    naive_errors = np.abs(np.diff(training_series))
+    mae_naive = np.mean(naive_errors)
+
+    # Avoid division by zero
+    if mae_naive == 0:
+        mae_naive = 1e-10
+
+    mase = mae_forecast / mae_naive
+    return mase
+
 print("Setting random seeds...")
 np.random.seed(42)
 torch.manual_seed(42)
@@ -189,9 +210,10 @@ for idx in range(min(3, n_series)):
 
     # Calculate metrics
     actuals_display = np.array(ts_display[hist_length:])
-    mae_tweedie = np.mean(np.abs(np.array(forecast_tweedie.median) - actuals_display))
-    zeros_count = (np.array(ts_display[:hist_length]) == 0).sum()
-    stats_text = f'MAE: {mae_tweedie:.2f}\nZeros: {zeros_count}\nVariance: power-law'
+    training_display = np.array(ts_display[:hist_length])
+    mase_tweedie = compute_mase(np.array(forecast_tweedie.median), actuals_display, training_display)
+    zeros_count = (training_display == 0).sum()
+    stats_text = f'MASE: {mase_tweedie:.2f}\nZeros: {zeros_count}\nVariance: power-law'
     ax_tweedie.text(0.02, 0.98, stats_text, transform=ax_tweedie.transAxes,
                     verticalalignment='top', bbox=dict(boxstyle='round',
                     facecolor='lightblue', alpha=0.8), fontsize=8)
@@ -219,8 +241,8 @@ for idx in range(min(3, n_series)):
     ax_normal.legend(loc='best', fontsize=8)
     ax_normal.grid(True, alpha=0.3)
 
-    mae_normal = np.mean(np.abs(np.array(forecast_normal.median) - actuals_display))
-    stats_text = f'MAE: {mae_normal:.2f}\nZeros: {zeros_count}\nVariance: constant'
+    mase_normal = compute_mase(np.array(forecast_normal.median), actuals_display, training_display)
+    stats_text = f'MASE: {mase_normal:.2f}\nZeros: {zeros_count}\nVariance: constant'
     ax_normal.text(0.02, 0.98, stats_text, transform=ax_normal.transAxes,
                    verticalalignment='top', bbox=dict(boxstyle='round',
                    facecolor='plum', alpha=0.8), fontsize=8)
@@ -234,38 +256,39 @@ plt.close()
 print("\nComputing aggregate metrics...")
 
 # Compute metrics for all series
-maes_normal = []
-maes_tweedie = []
+mases_normal = []
+mases_tweedie = []
 rmses_normal = []
 rmses_tweedie = []
 
 for forecast_normal, forecast_tweedie, ts in zip(forecasts_normal, forecasts_tweedie, tss_normal):
     actuals = np.array(ts[-prediction_length:])
+    training = np.array(ts[:-prediction_length])
 
-    mae_normal = np.mean(np.abs(np.array(forecast_normal.median) - actuals))
-    mae_tweedie = np.mean(np.abs(np.array(forecast_tweedie.median) - actuals))
+    mase_normal = compute_mase(np.array(forecast_normal.median), actuals, training)
+    mase_tweedie = compute_mase(np.array(forecast_tweedie.median), actuals, training)
 
     rmse_normal = np.sqrt(np.mean((np.array(forecast_normal.median) - actuals) ** 2))
     rmse_tweedie = np.sqrt(np.mean((np.array(forecast_tweedie.median) - actuals) ** 2))
 
-    maes_normal.append(mae_normal)
-    maes_tweedie.append(mae_tweedie)
+    mases_normal.append(mase_normal)
+    mases_tweedie.append(mase_tweedie)
     rmses_normal.append(rmse_normal)
-    rmses_tweedie.append(rmse_normal)
+    rmses_tweedie.append(rmse_tweedie)
 
 fig2, axes2 = plt.subplots(1, 2, figsize=(14, 5))
 fig2.suptitle('Aggregate Performance Comparison: Tweedie vs Normal', fontsize=14, fontweight='bold')
 
-# MAE comparison
+# MASE comparison
 ax = axes2[0]
 x_pos = np.arange(2)
-means = [np.mean(maes_tweedie), np.mean(maes_normal)]
-stds = [np.std(maes_tweedie), np.std(maes_normal)]
+means = [np.mean(mases_tweedie), np.mean(mases_normal)]
+stds = [np.std(mases_tweedie), np.std(mases_normal)]
 colors = ['blue', 'purple']
 
 bars = ax.bar(x_pos, means, yerr=stds, alpha=0.7, color=colors, capsize=10, edgecolor='black')
-ax.set_ylabel('Mean Absolute Error (MAE)', fontsize=12)
-ax.set_title('MAE Comparison (lower is better)', fontsize=12, fontweight='bold')
+ax.set_ylabel('Mean Absolute Scaled Error (MASE)', fontsize=12)
+ax.set_title('MASE Comparison (lower is better)', fontsize=12, fontweight='bold')
 ax.set_xticks(x_pos)
 ax.set_xticklabels(['Tweedie', 'Normal'])
 ax.grid(True, alpha=0.3, axis='y')
@@ -278,7 +301,7 @@ for i, (bar, mean, std) in enumerate(zip(bars, means, stds)):
 
 # Improvement percentage
 ax = axes2[1]
-improvement = ((np.mean(maes_normal) - np.mean(maes_tweedie)) / np.mean(maes_normal)) * 100
+improvement = ((np.mean(mases_normal) - np.mean(mases_tweedie)) / np.mean(mases_normal)) * 100
 colors_imp = ['green' if improvement > 0 else 'red']
 bars = ax.bar([0], [improvement], alpha=0.7, color=colors_imp, edgecolor='black')
 ax.axhline(y=0, color='black', linestyle='-', linewidth=1)
@@ -298,8 +321,8 @@ plt.close()
 print("\n" + "="*70)
 print("Real comparison completed successfully!")
 print("="*70)
-print(f"\nAverage MAE - Tweedie: {np.mean(maes_tweedie):.3f} ± {np.std(maes_tweedie):.3f}")
-print(f"Average MAE - Normal:  {np.mean(maes_normal):.3f} ± {np.std(maes_normal):.3f}")
+print(f"\nAverage MASE - Tweedie: {np.mean(mases_tweedie):.3f} ± {np.std(mases_tweedie):.3f}")
+print(f"Average MASE - Normal:  {np.mean(mases_normal):.3f} ± {np.std(mases_normal):.3f}")
 print(f"\nImprovement: {improvement:+.1f}%")
 print("\nPlots saved:")
 print("  - tweedie_deepar_forecast_real.png (actual trained model forecasts)")
