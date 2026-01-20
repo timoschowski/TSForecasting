@@ -1,5 +1,11 @@
-# PyTorch Lightning checkpoints
+# PyTorch Lightning checkpoints and logs
 checkpoints/
+lightning_logs/
+
+# Debug/test scripts
+check_*.py
+debug_*.py
+print_*.py
 
 # Python
 __pycache__/
