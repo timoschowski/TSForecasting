@@ -188,8 +188,9 @@ for idx in range(min(3, n_series)):
     ax_tweedie.grid(True, alpha=0.3)
 
     # Calculate metrics
-    mae_tweedie = np.mean(np.abs(forecast_tweedie.median - ts_display[hist_length:]))
-    zeros_count = (ts_display[:hist_length] == 0).sum()
+    actuals_display = np.array(ts_display[hist_length:])
+    mae_tweedie = np.mean(np.abs(np.array(forecast_tweedie.median) - actuals_display))
+    zeros_count = (np.array(ts_display[:hist_length]) == 0).sum()
     stats_text = f'MAE: {mae_tweedie:.2f}\nZeros: {zeros_count}\nVariance: power-law'
     ax_tweedie.text(0.02, 0.98, stats_text, transform=ax_tweedie.transAxes,
                     verticalalignment='top', bbox=dict(boxstyle='round',
@@ -218,7 +219,7 @@ for idx in range(min(3, n_series)):
     ax_normal.legend(loc='best', fontsize=8)
     ax_normal.grid(True, alpha=0.3)
 
-    mae_normal = np.mean(np.abs(forecast_normal.median - ts_display[hist_length:]))
+    mae_normal = np.mean(np.abs(np.array(forecast_normal.median) - actuals_display))
     stats_text = f'MAE: {mae_normal:.2f}\nZeros: {zeros_count}\nVariance: constant'
     ax_normal.text(0.02, 0.98, stats_text, transform=ax_normal.transAxes,
                    verticalalignment='top', bbox=dict(boxstyle='round',
@@ -239,13 +240,13 @@ rmses_normal = []
 rmses_tweedie = []
 
 for forecast_normal, forecast_tweedie, ts in zip(forecasts_normal, forecasts_tweedie, tss_normal):
-    actuals = ts[-prediction_length:]
+    actuals = np.array(ts[-prediction_length:])
 
-    mae_normal = np.mean(np.abs(forecast_normal.median - actuals))
-    mae_tweedie = np.mean(np.abs(forecast_tweedie.median - actuals))
+    mae_normal = np.mean(np.abs(np.array(forecast_normal.median) - actuals))
+    mae_tweedie = np.mean(np.abs(np.array(forecast_tweedie.median) - actuals))
 
-    rmse_normal = np.sqrt(np.mean((forecast_normal.median - actuals) ** 2))
-    rmse_tweedie = np.sqrt(np.mean((forecast_tweedie.median - actuals) ** 2))
+    rmse_normal = np.sqrt(np.mean((np.array(forecast_normal.median) - actuals) ** 2))
+    rmse_tweedie = np.sqrt(np.mean((np.array(forecast_tweedie.median) - actuals) ** 2))
 
     maes_normal.append(mae_normal)
     maes_tweedie.append(mae_tweedie)
