@@ -58,20 +58,27 @@ This provides **incorrect gradients for φ** (dispersion parameter), causing it 
 log_prob = normalizing_const + deviance_term
 ```
 
-**Results**:
+**Results WITH Scaling**:
 - Tweedie OLD (deviance): MASE 6.32 (+187%)
 - TweedieFull NEW (series): MASE 151.87 (+6802%)
-- **MUCH WORSE than deviance-based!**
-
-**Why it failed**: Implementation bugs
 - Forecasts 56-106 instead of 7-13 (10x too high)
-- Likely errors in:
-  - Series bounds determination
-  - Log-weights calculation
-  - Numerical stability
-  - Formula translation
 
-**Verdict**: ❌ BUGGY IMPLEMENTATION (needs extensive debugging)
+**Results WITHOUT Scaling** (to isolate scaling issues):
+- Normal: MASE 1.23 (works perfectly!)
+- TweedieFull: MASE 61.80 (+4936%)
+- Forecasts 38-43 instead of 7-13 (4x too high)
+- **Removing scaling helped (from +6802% to +4936%), but still catastrophic**
+
+**Why it failed**: Fundamental implementation bugs beyond scaling
+- Parameter recovery works (mu=5.4%, phi=7.1% error) ✓
+- But DeepAR training fails spectacularly ✗
+- Likely errors in:
+  - Numerical instability during neural network training
+  - Series bounds determination in training context
+  - Gradient flow with backpropagation
+  - Edge cases not covered by parameter recovery test
+
+**Verdict**: ❌ BUGGY IMPLEMENTATION (needs extensive debugging, not just scaling fixes)
 
 #### Option 3: Use Different Distribution
 **Approach**: Use NegativeBinomial instead
@@ -102,20 +109,39 @@ Even with PyTorch's reference approach:
 - Numerical stability is tricky
 - 10-50x slower than simple deviance formula
 
-### 4. Not All Bugs Show Up in Unit Tests
+### 4. Scaling Was Not the Main Issue
+
+We hypothesized that MeanScaler interaction was causing TweedieFull to fail:
+- WITH scaling: MASE 151.87 (+6802%)
+- WITHOUT scaling: MASE 61.80 (+4936%)
+- Removing scaling helped, but **still catastrophic**
+
+**The real issues are deeper**:
+- Parameter recovery works in isolation (5-7% error)
+- But neural network training fails completely
+- Likely: numerical instability during backpropagation
+- Or: series bounds calculation wrong in training context
+
+### 5. Not All Bugs Show Up in Unit Tests
 
 GluonTS Tweedie had **82 passing unit tests**, yet:
 - Parameter recovery failed completely
 - Real-world performance was poor
 - Gradient bug went undetected
 
+TweedieFull has **parameter recovery test passing**, yet:
+- DeepAR training fails completely
+- Even simple sinusoid forecasting fails
+- Bugs only appear during neural network training
+
 Tests checked:
 - ✓ Mean and variance (analytical properties)
 - ✓ Sampling (forward pass)
 - ✓ Scaling transformations
 - ✓ Domain constraints
-- ✗ Parameter recovery via MLE (NOT tested)
-- ✗ Gradient correctness (NOT tested)
+- ✓ Parameter recovery (TweedieFull only)
+- ✗ DeepAR integration (NOT tested)
+- ✗ Neural network training stability (NOT tested)
 
 ## Final Recommendations
 
@@ -167,6 +193,8 @@ estimator = DeepAREstimator(
 3. `compare_tweedie_vs_normal.py` - Learned φ performance
 4. `test_tweedie_fixed_to_normal.py` - Fixed φ from Normal (failed worse)
 5. `test_pytorch_style_tweedie.py` - Option 2 implementation (buggy)
+6. `test_parameter_recovery_pytorch_style.py` - TweedieFull parameter recovery (PASSES!)
+7. `test_tweedie_no_scaling.py` - TweedieFull without MeanScaler (still fails)
 
 ### Documentation Created
 1. `CRITICAL_FINDING_PHI_GRADIENT_BUG.md` - Initial discovery
@@ -178,21 +206,23 @@ estimator = DeepAREstimator(
 
 | Approach | MASE | vs Normal | Verdict |
 |----------|------|-----------|---------|
-| Normal (baseline) | 2.20 | -- | ✓ Works |
+| Normal (baseline, WITH scaling) | 2.20 | -- | ✓ Works |
 | Tweedie learned φ (run 1) | 2.58 | +17% | ✓ Acceptable |
 | Tweedie learned φ (run 2) | 3.44 | +55% | ~ Moderate |
 | Tweedie learned φ (run 3) | 6.28 | +186% | ✗ Poor |
 | Tweedie fixed φ (data) | 30.59 | +1285% | ✗ Catastrophic |
 | Tweedie fixed φ (Normal) | 17.35 | +689% | ✗ Catastrophic |
-| TweedieFull (series) | 151.87 | +6802% | ✗ Buggy impl |
+| TweedieFull (series, WITH scaling) | 151.87 | +6802% | ✗ Buggy impl |
+| Normal (baseline, NO scaling) | 1.23 | -- | ✓ Works perfectly |
+| TweedieFull (series, NO scaling) | 61.80 | +4936% | ✗ Still buggy! |
 
 ### Time Investment
 
 - Investigation: ~6 hours
-- Implementation attempts: ~4 hours
-- Testing and debugging: ~3 hours
+- Implementation attempts: ~5 hours (including TweedieFull)
+- Testing and debugging: ~4 hours (including no-scaling test)
 - Documentation: ~2 hours
-- **Total: ~15 hours**
+- **Total: ~17 hours**
 
 **Conclusion**: Not worth further time investment. Use NegativeBinomial.
 
@@ -200,11 +230,25 @@ estimator = DeepAREstimator(
 
 If we had successfully implemented Option 2:
 - TweedieFull MASE would be within 10% of Normal
-- φ would converge to correct values in parameter recovery test
+- φ would converge to correct values in parameter recovery test ✓ (ACHIEVED!)
 - Training would be stable across runs
 - Forecasts would be accurate and well-calibrated
 
-**We did not achieve this** - implementation has bugs that need extensive debugging.
+**We achieved parameter recovery**, which proves the math is correct:
+- mu: 5.4% error ✓
+- phi: 7.1% error ✓
+- Gradients correct at true parameters ✓
+
+**But DeepAR training still fails catastrophically**:
+- WITH scaling: MASE +6802%
+- WITHOUT scaling: MASE +4936%
+- Forecasts 4-10x too high
+- No pattern learning (flat predictions)
+
+**Conclusion**: Implementation has bugs that manifest only during neural network training, not in simple parameter recovery. Needs extensive debugging of:
+- Numerical stability during backpropagation
+- Series bounds calculation in batch training
+- Gradient flow through complex computational graph
 
 ## The Bottom Line
 
