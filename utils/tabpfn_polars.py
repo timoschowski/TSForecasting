@@ -205,3 +205,152 @@ def find_anomalies(
         ])
 
     return pl.DataFrame({col: df[col], "prob": pl.Series("prob", probs)})
+
+
+# ── 3. find_similar_rows ─────────────────────────────────────────────────────
+
+
+def _get_embeddings(X: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Return row embeddings using TabPFN if available, else sklearn leaf nodes."""
+    if _check_tabpfn():
+        from tabpfn import TabPFNClassifier
+
+        clf = TabPFNClassifier()
+        clf.fit(X, y)
+        return clf.get_embeddings(X, data_source="train")
+
+    from sklearn.ensemble import RandomForestClassifier
+
+    clf = RandomForestClassifier(n_estimators=100, random_state=0)
+    clf.fit(X, y)
+    # Use leaf-node indices across all trees as an embedding
+    leaf_indices = clf.apply(X)  # (n_samples, n_trees)
+    return leaf_indices.astype(float)
+
+
+def find_similar_rows(
+    df: pl.DataFrame,
+    row_index: int,
+    k: int = 5,
+    context_columns: Optional[Sequence[str]] = None,
+) -> pl.DataFrame:
+    """Find the *k* most similar rows to a given row using TabPFN embeddings.
+
+    A dummy classification target is constructed from quantile bins of the
+    first context column so that TabPFN can produce embeddings.  Similarity
+    is measured by cosine distance in the embedding space.
+
+    Parameters
+    ----------
+    df:
+        Source data frame.
+    row_index:
+        Index of the query row.
+    k:
+        Number of nearest neighbours to return (default 5).
+    context_columns:
+        Columns to use for computing embeddings.  Defaults to all columns.
+
+    Returns
+    -------
+    pl.DataFrame
+        The *k* closest rows (excluding the query row itself), with an extra
+        ``similarity`` column (1 = identical, 0 = orthogonal).
+    """
+    if context_columns is None:
+        context_columns = list(df.columns)
+    if not context_columns:
+        raise ValueError("Need at least one column for embeddings.")
+
+    X = df.select(context_columns).to_numpy().astype(float)
+
+    # Build a synthetic classification target for the embedding model
+    ref_col = X[:, 0]
+    n_bins = min(5, len(np.unique(ref_col)))
+    n_bins = max(n_bins, 2)
+    quantiles = np.unique(np.nanquantile(ref_col, np.linspace(0, 1, n_bins + 1)))
+    if len(quantiles) < 3:
+        y_dummy = np.zeros(len(X), dtype=int)
+    else:
+        y_dummy = np.digitize(ref_col, quantiles[1:-1])
+
+    embeddings = _get_embeddings(X, y_dummy)
+
+    # Cosine similarity
+    query = embeddings[row_index]
+    norms = np.linalg.norm(embeddings, axis=1) * np.linalg.norm(query)
+    norms = np.where(norms == 0, 1e-10, norms)
+    similarities = embeddings @ query / norms
+
+    # Exclude the query row itself, pick top-k
+    similarities[row_index] = -np.inf
+    top_k_indices = np.argsort(similarities)[::-1][:k]
+
+    result = df[top_k_indices.tolist()]
+    return result.with_columns(
+        pl.Series("similarity", similarities[top_k_indices])
+    )
+
+
+# ── 4. extrapolate_dataframe ─────────────────────────────────────────────────
+
+
+def extrapolate_dataframe(
+    df: pl.DataFrame,
+    n_rows: int,
+    context_columns: Optional[Sequence[str]] = None,
+) -> pl.DataFrame:
+    """Generate *n_rows* new synthetic rows by extrapolating from existing data.
+
+    Each column is predicted in turn, conditioned on the other columns.
+    New feature vectors are created by sampling existing rows and adding
+    Gaussian noise, then each column is re-predicted by TabPFN (or fallback)
+    to produce coherent synthetic records.
+
+    Parameters
+    ----------
+    df:
+        Source data frame (numeric columns only).
+    n_rows:
+        Number of new rows to generate.
+    context_columns:
+        Columns to include.  Defaults to all columns.
+
+    Returns
+    -------
+    pl.DataFrame
+        A data frame with *n_rows* synthetic rows and the same schema as the
+        selected columns.
+    """
+    if context_columns is None:
+        context_columns = list(df.columns)
+    if len(context_columns) < 2:
+        raise ValueError("Need at least two columns to extrapolate.")
+
+    data = df.select(context_columns).to_numpy().astype(float)
+    n_orig, n_cols = data.shape
+
+    rng = np.random.default_rng(seed=0)
+
+    # Bootstrap sample + small perturbation as seed rows
+    sample_indices = rng.choice(n_orig, size=n_rows, replace=True)
+    col_stds = np.nanstd(data, axis=0)
+    col_stds = np.where(col_stds == 0, 1.0, col_stds)
+    noise = rng.normal(scale=col_stds * 0.1, size=(n_rows, n_cols))
+    synthetic = data[sample_indices] + noise
+
+    # Refine each column by predicting it from the others
+    for col_idx in range(n_cols):
+        feature_idx = [j for j in range(n_cols) if j != col_idx]
+        X_train = data[:, feature_idx]
+        y_train = data[:, col_idx]
+        X_pred = synthetic[:, feature_idx]
+
+        model = _get_regressor()
+        model.fit(X_train, y_train)
+        synthetic[:, col_idx] = model.predict(X_pred)
+
+    return pl.DataFrame(
+        {col: synthetic[:, i] for i, col in enumerate(context_columns)},
+        schema={col: df[col].dtype for col in context_columns},
+    )
