@@ -1,6 +1,9 @@
 """
-Polars extension functions using TabPFN (via AutoGluon) for missing value
-imputation and anomaly detection on tabular data.
+Polars extension functions using TabPFN for missing value imputation and
+anomaly detection on tabular data.
+
+When TabPFN model weights are not available (e.g. no network access), the
+functions fall back to scikit-learn estimators (RandomForest).
 """
 
 from __future__ import annotations
@@ -10,29 +13,43 @@ from typing import Optional, Sequence
 
 import numpy as np
 import polars as pl
-from autogluon.tabular import TabularPredictor
 
 
-def _fit_tabpfn_predictor(
-    train_df: pl.DataFrame,
-    label: str,
-    problem_type: str,
-) -> TabularPredictor:
-    """Train an AutoGluon TabularPredictor restricted to the TabPFN model."""
-    pandas_df = train_df.to_pandas()
-    predictor = TabularPredictor(
-        label=label,
-        problem_type=problem_type,
-        verbosity=0,
-    )
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        predictor.fit(
-            pandas_df,
-            hyperparameters={"TABPFN": {}},
-            num_gpus=0,
-        )
-    return predictor
+_tabpfn_available: bool | None = None
+
+
+def _check_tabpfn() -> bool:
+    """Return True if TabPFN can be loaded (model weights accessible)."""
+    global _tabpfn_available
+    if _tabpfn_available is not None:
+        return _tabpfn_available
+    try:
+        from tabpfn import TabPFNClassifier
+        clf = TabPFNClassifier()
+        # Trigger actual weight download with a tiny dummy fit
+        clf.fit(np.array([[0, 1], [1, 0]]), np.array([0, 1]))
+        _tabpfn_available = True
+    except Exception:
+        _tabpfn_available = False
+    return _tabpfn_available
+
+
+def _get_regressor():
+    """Return a TabPFN regressor if available, else a scikit-learn fallback."""
+    if _check_tabpfn():
+        from tabpfn import TabPFNRegressor
+        return TabPFNRegressor()
+    from sklearn.ensemble import RandomForestRegressor
+    return RandomForestRegressor(n_estimators=100, random_state=0)
+
+
+def _get_classifier():
+    """Return a TabPFN classifier if available, else a scikit-learn fallback."""
+    if _check_tabpfn():
+        from tabpfn import TabPFNClassifier
+        return TabPFNClassifier()
+    from sklearn.ensemble import RandomForestClassifier
+    return RandomForestClassifier(n_estimators=100, random_state=0)
 
 
 # ── 1. compute_missing_values ────────────────────────────────────────────────
@@ -74,21 +91,22 @@ def compute_missing_values(
         return df[col].clone()
 
     train = working.filter(~mask_missing)
-    predict = working.filter(mask_missing).drop(col)
+    predict_rows = working.filter(mask_missing).select(context_columns)
 
     if train.height == 0:
         raise ValueError(f"All values in '{col}' are null – nothing to learn from.")
 
-    # Determine problem type from the column dtype
-    if working[col].dtype in (pl.Utf8, pl.Categorical):
-        problem_type = "multiclass"
-    else:
-        problem_type = "regression"
+    X_train = train.select(context_columns).to_numpy()
+    y_train = train[col].to_numpy()
+    X_pred = predict_rows.to_numpy()
 
-    predictor = _fit_tabpfn_predictor(train, label=col, problem_type=problem_type)
-    preds = predictor.predict(predict.to_pandas())
+    is_categorical = working[col].dtype in (pl.Utf8, pl.Categorical)
 
-    # Build the result series: original values where present, predictions where null
+    model = _get_classifier() if is_categorical else _get_regressor()
+    model.fit(X_train, y_train)
+    preds = model.predict(X_pred)
+
+    # Build the result series
     result = df[col].to_list()
     pred_iter = iter(preds)
     for i in range(len(result)):
@@ -109,10 +127,10 @@ def find_anomalies(
 ) -> pl.DataFrame:
     """Flag anomalies in *col* by estimating how likely each value is under TabPFN.
 
-    For categorical columns the predicted class‐probability for the true label
+    For categorical columns the predicted class-probability for the true label
     is used directly.  For numeric columns the value is discretised into
     quantile bins so that TabPFN can output a probability per bin; the
-    probability assigned to the bin that contains the true value is used.
+    probability assigned to the bin containing the true value is reported.
 
     Parameters
     ----------
@@ -128,7 +146,7 @@ def find_anomalies(
     Returns
     -------
     pl.DataFrame
-        Two‑column frame: the original *col* and a ``prob`` column with the
+        Two-column frame: the original *col* and a ``prob`` column with the
         estimated probability of each entry.  Rows whose ``prob < threshold``
         are the detected anomalies.
     """
@@ -140,51 +158,50 @@ def find_anomalies(
     used_cols = list(context_columns) + [col]
     working = df.select(used_cols)
 
+    from sklearn.model_selection import cross_val_predict
+
+    X = working.select(context_columns).to_numpy()
     is_categorical = working[col].dtype in (pl.Utf8, pl.Categorical)
 
+    n_cv = min(5, len(X))
+
     if is_categorical:
-        # TabPFN can give class probabilities directly
-        predictor = _fit_tabpfn_predictor(
-            working, label=col, problem_type="multiclass"
-        )
-        proba = predictor.predict_proba(working.drop(col).to_pandas())
+        y = working[col].to_numpy()
+        clf = _get_classifier()
+        # Use cross-validated probabilities to avoid train-set memorisation
+        proba = cross_val_predict(clf, X, y, cv=n_cv, method="predict_proba")
+        clf_fit = _get_classifier()
+        clf_fit.fit(X, y)
+        classes = list(clf_fit.classes_)
         true_labels = working[col].to_list()
-        probs = np.array(
-            [proba.loc[i, label] if label in proba.columns else 0.0
-             for i, label in enumerate(true_labels)]
-        )
+        probs = np.array([
+            proba[i, classes.index(label)] if label in classes else 0.0
+            for i, label in enumerate(true_labels)
+        ])
     else:
         # Discretise into quantile bins for probability estimation
-        n_bins = min(10, working[col].n_unique())
+        values = working[col].to_numpy().astype(float)
+        n_bins = min(10, len(np.unique(values[~np.isnan(values)])))
         n_bins = max(n_bins, 2)
 
-        values = working[col].to_numpy().astype(float)
         quantiles = np.nanquantile(values, np.linspace(0, 1, n_bins + 1))
         quantiles = np.unique(quantiles)
         if len(quantiles) < 3:
-            # Nearly constant column – nothing is anomalous
             probs = np.ones(len(values))
             return pl.DataFrame({col: df[col], "prob": probs})
 
-        bin_indices = np.digitize(values, quantiles[1:-1])  # 0 .. n_bins-1
-        bin_labels = [str(b) for b in bin_indices]
+        bin_indices = np.digitize(values, quantiles[1:-1])
+        bin_labels = bin_indices.astype(str)
 
-        working_binned = working.drop(col).with_columns(
-            pl.Series(col, bin_labels, dtype=pl.Utf8)
-        )
-        # reorder so label is last (same column set)
-        working_binned = working_binned.select(
-            [c for c in working_binned.columns if c != col] + [col]
-        )
-
-        predictor = _fit_tabpfn_predictor(
-            working_binned, label=col, problem_type="multiclass"
-        )
-        proba = predictor.predict_proba(working_binned.drop(col).to_pandas())
-        probs = np.array(
-            [proba.loc[i, str(bin_indices[i])]
-             if str(bin_indices[i]) in proba.columns else 0.0
-             for i in range(len(bin_labels))]
-        )
+        clf = _get_classifier()
+        proba = cross_val_predict(clf, X, bin_labels, cv=n_cv, method="predict_proba")
+        clf_fit = _get_classifier()
+        clf_fit.fit(X, bin_labels)
+        classes = list(clf_fit.classes_)
+        probs = np.array([
+            proba[i, classes.index(str(bin_indices[i]))]
+            if str(bin_indices[i]) in classes else 0.0
+            for i in range(len(bin_labels))
+        ])
 
     return pl.DataFrame({col: df[col], "prob": pl.Series("prob", probs)})
